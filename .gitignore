@@ -54,3 +54,4 @@ node_modules/
 DEVELOPMENT_ROADMAP.md
 /plugins/runtime-logs/dsh-demo-plugin.log
 /plugins/dsh-java-mysql-plugin.jar
+/.walicode/
