@@ -214,6 +214,8 @@ const state = {
   fileTree: null,     // 当前工作区文件树根节点
   fileTreePath: null, // fileTree 对应的工作区路径
   fileTreeLoading: false,
+  fileTreeError: null, // 最近一次加载失败原因（非空时停止自动重试，避免「失败→重载→再失败」死循环闪烁）
+  fileTreeErrorWs: null, // fileTreeError 所属的工作区路径（切换工作区后允许重新自动加载）
   fileTreeCollapsed: {}, // 记录收起的目录 path -> true
   // v29: 轨迹视图搜索关键字
   trajSearch: '',
@@ -490,8 +492,11 @@ function renderLayout() {
   // 右侧面板与 .main 平级（.main-area 为横向 flex），避免被 .main 纵向 flex 压成 0 宽
   if (state.activePanel) {
     mainArea.appendChild(renderSidePanel());
-    // 信息面板常驻：首次挂载时若无文件树缓存则异步加载一次
-    if (state.activePanel === 'info' && !state.fileTree && !state.fileTreeLoading) {
+    // 信息面板常驻：首次挂载时若无文件树缓存且上次未失败，则异步加载一次
+    // （失败后不自动重试：否则工作区目录不存在时会陷入「失败→重载→再失败」的渲染死循环；
+    //   切换到别的工作区则允许重新加载）
+    if (state.activePanel === 'info' && !state.fileTree && !state.fileTreeLoading
+        && (!state.fileTreeError || state.fileTreeErrorWs !== (state.currentWorkspace || ''))) {
       setTimeout(function() { loadWorkspaceFileTree(false); }, 0);
     }
   }
@@ -2819,6 +2824,15 @@ function renderRunInfoPanel(body, sess) {
   const treeWrap = el('div', { class: 'runinfo-tree' });
   if (state.fileTreeLoading) {
     treeWrap.appendChild(el('div', { class: 'empty' }, '加载文件树…'));
+  } else if (state.fileTreeError) {
+    // 加载失败：展示原因 + 手动重试（不自动重试，避免死循环闪烁）
+    const errWrap = el('div', { class: 'empty' });
+    errWrap.appendChild(el('div', { style: 'margin-bottom:8px;word-break:break-all;' }, '文件树加载失败：' + state.fileTreeError));
+    errWrap.appendChild(el('button', {
+      class: 'btn btn-primary',
+      onclick: function() { loadWorkspaceFileTree(true); }
+    }, '重试'));
+    treeWrap.appendChild(errWrap);
   } else if (!state.fileTree) {
     treeWrap.appendChild(el('div', { class: 'empty' }, '暂无文件（点击 ⟳ 加载）'));
   } else {
@@ -2926,6 +2940,8 @@ async function loadWorkspaceFileTree(force) {
   const wsPath = state.currentWorkspace || '';
   if (!force && state.fileTree && state.fileTreePath === wsPath) { render(); return; }
   state.fileTreeLoading = true;
+  state.fileTreeError = null; // 手动重试或切换工作区时清掉上次失败标记
+  state.fileTreeErrorWs = null;
   if (state.activePanel === 'info') render();
   try {
     const qs = wsPath ? ('?path=' + encodeURIComponent(wsPath) + '&depth=6') : '?depth=6';
@@ -2941,6 +2957,8 @@ async function loadWorkspaceFileTree(force) {
     state.fileTreePath = wsPath;
   } catch (e) {
     state.fileTree = null;
+    state.fileTreeError = e.message; // 记录失败原因：渲染层据此停止自动重试
+    state.fileTreeErrorWs = wsPath;
     if (state.activePanel === 'info') showToast('文件树加载失败：' + e.message);
   } finally {
     state.fileTreeLoading = false;
