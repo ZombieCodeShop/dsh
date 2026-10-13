@@ -5,6 +5,7 @@ package cn.xiaofuge.deepseek.harness.domain.agent.model.valobj;
  */
 public sealed interface AgentCancelCause
         permits AgentCancelCause.UserCancel,
+                AgentCancelCause.ParentCancel,
                 AgentCancelCause.Disposed,
                 AgentCancelCause.Maintenance {
 
@@ -12,6 +13,11 @@ public sealed interface AgentCancelCause
      * UserCancel 表示UserCancel。
      */
     record UserCancel(String reason) implements AgentCancelCause {}
+
+    /**
+     * ParentCancel 表示由父代理发起的取消（子代理生命周期随父级结束）。
+     */
+    record ParentCancel(String reason) implements AgentCancelCause {}
 
     /**
      * Disposed 表示Disposed。

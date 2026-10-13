@@ -192,8 +192,19 @@ public final class AgentToolCatalog {
 
         if (subagentRegistry != null && !subagentRegistry.listProviderNames().isEmpty()) {
             String providerName = subagentRegistry.listProviderNames().get(0);
+            // 父级上下文：会话身份（谱系事实）、当前有效目录（子级继承基线）、
+            // 委派深度（top-level 工具入口为 0，注册表准入阶段再校验上限）。
+            java.util.function.Supplier<String> parentCwdSupplier = context.cwdRef() != null
+                    ? context.cwdRef()::get
+                    : () -> context.cwd();
             localRegistry.register(new SubagentTool(
-                    subagentRegistry, providerName, "subagent", context.optionsSupplier()));
+                    subagentRegistry,
+                    providerName,
+                    "subagent",
+                    context.optionsSupplier(),
+                    context.agentId() == null ? null : () -> context.agentId(),
+                    parentCwdSupplier,
+                    0));
         }
 
         return new CompositeToolRegistry(localRegistry, sharedRegistry);

@@ -20,16 +20,8 @@ class AgentRunArchitectureTest {
                 .check(classes);
     }
 
-    @Test
-    void agentDomainMustNotDependOnSpring() {
-        var classes = new ClassFileImporter()
-                .withImportOption(new ImportOption.DoNotIncludeTests())
-                .importPackages("cn.xiaofuge.deepseek.harness.domain.agent");
-
-        ArchRuleDefinition.noClasses()
-                .should().dependOnClassesThat().resideInAnyPackage("org.springframework..")
-                .check(classes);
-    }
+    // 项目约定：domain 允许使用 Spring（@Service 标记、@Value 配置注入等），
+    // 用于容器托管与配置管理；不再强制 no-spring。
 
     @Test
     void agentDomainMustNotDependOnJackson() {

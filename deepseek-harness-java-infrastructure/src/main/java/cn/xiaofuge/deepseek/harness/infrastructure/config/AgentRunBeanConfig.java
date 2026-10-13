@@ -85,6 +85,11 @@ public class AgentRunBeanConfig {
     }
 
     @Bean
+    public cn.xiaofuge.deepseek.harness.domain.session.directory.WorkingDirectoryPort workingDirectoryPort() {
+        return new cn.xiaofuge.deepseek.harness.infrastructure.adapter.directory.InMemoryWorkingDirectoryAdapter();
+    }
+
+    @Bean
     public ToolRegistry toolRegistry() {
         return new InMemoryToolRegistry();
     }
@@ -236,7 +241,8 @@ public class AgentRunBeanConfig {
             CompactionEngine compactionEngine,
             IHarnessPluginRepository pluginRepository,
             IPluginRuntimeService pluginRuntimeService,
-            @Value("${harness.agent.tool-timeout-ms:300000}") long toolTimeoutMs
+            @Value("${harness.agent.tool-timeout-ms:300000}") long toolTimeoutMs,
+            cn.xiaofuge.deepseek.harness.domain.session.directory.WorkingDirectoryPort workingDirectories
     ) {
         ISessionEventStore sessionEventStore = sessionEventStoreProvider.getIfAvailable();
         AgentRunFactory.SessionLogFactory sessionLogFactory = header -> sessionEventStore == null
@@ -267,7 +273,7 @@ public class AgentRunBeanConfig {
                 pluginRuntimeService
         );
 
-        return new AgentRunFactory(
+        AgentRunFactory factory = new AgentRunFactory(
                 llmRuntimePort,
                 toolRegistry,
                 systemPromptAssembler,
@@ -282,5 +288,7 @@ public class AgentRunBeanConfig {
                 compactionEngine,
                 toolTimeoutMs
         );
+        factory.setWorkingDirectories(workingDirectories);
+        return factory;
     }
 }

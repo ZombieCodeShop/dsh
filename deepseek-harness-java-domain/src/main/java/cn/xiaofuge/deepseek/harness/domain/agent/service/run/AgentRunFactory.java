@@ -50,6 +50,14 @@ public class AgentRunFactory implements AgentRunLifecycle {
     // 每个 Agent 的 cwd 引用：Agent 复用且请求换了工程目录时热更新，
     // 使 CwdResolvingFsPort 的相对路径解析跟随最新 cwd
     private final ConcurrentMap<String, java.util.concurrent.atomic.AtomicReference<String>> cwdRefs = new ConcurrentHashMap<>();
+    /** 工作目录 seam（可选）：会话创建/恢复登记、目录热更新时同步。 */
+    private volatile cn.xiaofuge.deepseek.harness.domain.session.directory.WorkingDirectoryPort workingDirectories;
+
+    /** 注入工作目录端口（可选；未注入时仅保留进程内 cwdRefs）。 */
+    public void setWorkingDirectories(
+            cn.xiaofuge.deepseek.harness.domain.session.directory.WorkingDirectoryPort workingDirectories) {
+        this.workingDirectories = workingDirectories;
+    }
 
     public AgentRunFactory(
             ILlmRuntimePort llm,
@@ -136,6 +144,12 @@ public class AgentRunFactory implements AgentRunLifecycle {
         if (reference != null) {
             reference.set(cwd);
         }
+        if (workingDirectories != null) {
+            cn.xiaofuge.deepseek.harness.domain.agent.service.run.AgentRun run = liveAgents.get(agentId);
+            if (run != null) {
+                workingDirectories.update(run.session().sessionId(), cwd);
+            }
+        }
     }
 
     public java.util.Collection<AgentRun> all() {
@@ -158,6 +172,9 @@ public class AgentRunFactory implements AgentRunLifecycle {
         java.util.concurrent.atomic.AtomicReference<String> cwdReference =
                 new java.util.concurrent.atomic.AtomicReference<>(cwd);
         cwdRefs.put(agentId, cwdReference);
+        if (workingDirectories != null && cwd != null && !cwd.isBlank()) {
+            workingDirectories.register(sessionId, cwd);
+        }
         ToolRegistry toolRegistry = toolCatalog.createRegistry(
                 new AgentToolContext(agentId, sessionId, cwd, session, userQuestions, optionsReference::get, cwdReference),
                 sharedToolRegistry

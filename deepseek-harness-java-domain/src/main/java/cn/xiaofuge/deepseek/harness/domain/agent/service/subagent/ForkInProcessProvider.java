@@ -1,31 +1,24 @@
 package cn.xiaofuge.deepseek.harness.domain.agent.service.subagent;
 
-import cn.xiaofuge.deepseek.harness.domain.agent.model.entity.AgentOptions;
-import cn.xiaofuge.deepseek.harness.domain.agent.model.valobj.InboxTarget;
-import cn.xiaofuge.deepseek.harness.domain.agent.service.run.AgentRun;
 import cn.xiaofuge.deepseek.harness.domain.agent.contract.inbound.AgentRunLifecycle;
-import cn.xiaofuge.deepseek.harness.domain.model.entity.Message;
-import cn.xiaofuge.deepseek.harness.domain.model.entity.MessageSource;
-import cn.xiaofuge.deepseek.harness.domain.model.valobj.ContentBlock;
-import cn.xiaofuge.deepseek.harness.domain.model.valobj.TextBlock;
+import cn.xiaofuge.deepseek.harness.domain.agent.model.entity.AgentOptions;
+import cn.xiaofuge.deepseek.harness.domain.agent.service.run.AgentRun;
 import cn.xiaofuge.deepseek.harness.domain.session.event.model.entity.SessionEvent;
 import cn.xiaofuge.deepseek.harness.domain.session.event.model.entity.SessionLog;
-import cn.xiaofuge.deepseek.harness.domain.session.event.model.valobj.TurnEndReason;
+
 import java.util.List;
-import java.util.Objects;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
-
 /**
- * ForkInProcessProvider 表示进程内复制子智能体的领域提供者。
+ * ForkInProcessProvider 表示进程内复制子智能体的后端。
+ *
+ * <p>对应 TS 侧 base fork 委派默认 continuable：子级继承父级当前工作
+ * 目录与模型选项；若提供父级会话（通过 {@link #withParentSession}），
+ * fork 会以父级已完成轮次前缀作为子会话的起始事实基础。</p>
+ *
+ * @author 小傅哥
+ * @website bugstack.cn
  */
-public class ForkInProcessProvider implements SubagentProvider {
-
-    private final String providerName;
-    private final SubagentRegistry registry;
-    private final AgentRunLifecycle agentFactory;
-    private final Supplier<AgentOptions> defaultOptionsSupplier;
+public class ForkInProcessProvider extends AbstractInProcessSubagentProvider {
 
     /**
      * 初始化进程内 Fork 子智能体提供者。
@@ -37,78 +30,15 @@ public class ForkInProcessProvider implements SubagentProvider {
             AgentRunLifecycle agentFactory,
             Supplier<AgentOptions> defaultOptionsSupplier
     ) {
-        this.providerName = providerName;
-        this.registry = registry;
-        this.agentFactory = agentFactory;
-        this.defaultOptionsSupplier = Objects.requireNonNull(defaultOptionsSupplier, "defaultOptionsSupplier");
+        super(providerName, registry, agentFactory, defaultOptionsSupplier);
     }
-    /**
-     * 返回 name。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @return 方法执行结果。
-     */
-
 
     @Override
-    public String name() {
-        return providerName;
-    }
-    /**
-     * 返回 capabilities。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @return 方法执行结果。
-     */
-
-
-    @Override
-    public SubagentCapabilities capabilities() {
-        return new SubagentCapabilities(true, true, true);
-    }
-    /**
-     * 启动目标对象。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param request 请求对象。
-     * @return 方法执行结果。
-     */
-
-
-    @Override
-    public CompletableFuture<SubagentResult> start(SubagentStartRequest request) {
-        return CompletableFuture.supplyAsync(() -> {
-            String childSessionId = "child-" + UUID.randomUUID();
-            AgentOptions childOptions = request.options() != null
-                    ? request.options()
-                    : Objects.requireNonNull(defaultOptionsSupplier.get(), "defaultOptionsSupplier returned null");
-
-            // Create child agent with fresh session
-            AgentRun childAgent = agentFactory.create(
-                    childSessionId,
-                    childOptions,
-                    request.parentCwd() != null ? request.parentCwd() : "."
-            );
-
-            // Deliver the prompt as a user message
-            List<ContentBlock> promptBlocks = List.of(
-                    new TextBlock(request.prompt() != null && !request.prompt().isEmpty()
-                            ? request.prompt() : "(empty task)")
-            );
-            Message userMessage = Message.createUser(promptBlocks, new MessageSource.UserSource());
-            childAgent.send(userMessage, InboxTarget.NEXT_TURN, true);
-
-            // Wait for the turn to complete
-            childAgent.whenIdle().join();
-
-            // Collect the last assistant message
-            List<ContentBlock> output = collectLastAssistantOutput(childAgent);
-
-            // Determine stop reason
-            String stopReason = determineStopReason(childAgent);
-
-            // Dispose the child agent
-            childAgent.dispose();
-
-            return new SubagentResult(stopReason, output, registry.nextRunId());
-        });
+    protected AgentRun prepareChild(SubagentActivationSpec spec, AgentOptions childOptions) {
+        // fork 语义：子级继承父级当前工作目录（resolvedCwd 缺省即父级目录）
+        // 与模型选项基线，拥有独立会话；父级已完成轮次前缀可通过
+        // completedTurnPrefix 提取，供调用方做种子回放。
+        return agentFactory.create(spec.childId(), childOptions, spec.resolvedCwd());
     }
 
     /**
@@ -128,46 +58,5 @@ public class ForkInProcessProvider implements SubagentProvider {
         }
         if (lastEndIdx < 0) return List.of();
         return List.copyOf(events.subList(0, lastEndIdx + 1));
-    }
-
-    /**
-     * 处理collect Last Assistant Output。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param agent Agent参数。
-     * @return 方法执行结果。
-     */
-    private List<ContentBlock> collectLastAssistantOutput(AgentRun agent) {
-        var events = agent.session().events();
-        TextBlock lastText = null;
-        for (var event : events) {
-            if (event instanceof SessionEvent.AssistantMessage am) {
-                var msg = am.data().message();
-                if (msg != null && msg.content() != null) {
-                    for (var block : msg.content()) {
-                        if (block instanceof TextBlock tb) {
-                            lastText = tb;
-                        }
-                    }
-                }
-            }
-        }
-        return lastText != null ? List.of(lastText) : List.of();
-    }
-
-    /**
-     * 处理determine Stop Reason。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param agent Agent参数。
-     * @return 方法执行结果。
-     */
-    private String determineStopReason(AgentRun agent) {
-        var events = agent.session().events();
-        TurnEndReason lastReason = null;
-        for (var event : events) {
-            if (event instanceof SessionEvent.TurnEnd te) {
-                lastReason = te.reason();
-            }
-        }
-        return SpawnInProcessProvider.mapStopReason(lastReason);
     }
 }

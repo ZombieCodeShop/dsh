@@ -1,5 +1,7 @@
 package cn.xiaofuge.deepseek.harness.infrastructure.adapter.subagent;
 
+import cn.xiaofuge.deepseek.harness.domain.agent.service.subagent.SubagentActivation;
+import cn.xiaofuge.deepseek.harness.domain.agent.service.subagent.SubagentActivationSpec;
 import cn.xiaofuge.deepseek.harness.domain.agent.service.subagent.SubagentProvider;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.ContentBlock;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.TextBlock;
@@ -7,12 +9,18 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Base for out-of-process subagent providers: spawns a child process, sends the
  * prompt via stdin, and reads the assistant output from stdout.
  *
- * <p>Subclasses define the command, arguments, and wire protocol encoding.
+ * <p>对应 TS 侧统一 activation API 的外部后端路径：实现 {@link #startActivation}，
+ * 进程句柄由 activation 持有；dispose 只终止这一次激活的子进程，
+ * 已自然退出的激活 dispose 为幂等 no-op。旧的
+ * {@link SubagentProvider#start} caller 交付路径由接口默认方法委托。</p>
+ *
+ * <p>Subclasses define the command, arguments, and wire protocol encoding.</p>
  *
  * @author 小傅哥
  * @website bugstack.cn
@@ -24,6 +32,11 @@ public abstract class OutOfProcessSubagentProvider implements SubagentProvider {
     protected final String cwd;
     protected final Map<String, String> env;
     protected final long timeoutMs;
+    private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "subagent-proc");
+        t.setDaemon(true);
+        return t;
+    });
 
     /**
      * 初始化进程外子智能体提供者。
@@ -46,36 +59,55 @@ public abstract class OutOfProcessSubagentProvider implements SubagentProvider {
     }
 
     @Override
-    public CompletableFuture<SubagentResult> start(SubagentStartRequest request) {
-        return CompletableFuture.supplyAsync(() -> runChild(request));
-    }
-    /**
-     * 返回 capabilities。
-     * 流程：适配外部协议或资源 → 调用底层能力 → 返回结果。
-     * @return 方法执行结果。
-     */
-
-
-    @Override
     public SubagentCapabilities capabilities() {
         return new SubagentCapabilities(false, false, false);
+    }
+
+    @Override
+    public CompletableFuture<SubagentActivation> startActivation(SubagentActivationSpec spec) {
+        CompletableFuture<SubagentActivation> ready = new CompletableFuture<>();
+        CompletableFuture<SubagentResult> result = new CompletableFuture<>();
+        AtomicReference<Process> processRef = new AtomicReference<>();
+
+        executor.execute(() -> {
+            try {
+                Process process = spawn(spec);
+                processRef.set(process);
+                ready.complete(new ProcessActivation(spec, result, processRef));
+                result.complete(runChild(spec, process));
+            } catch (Exception e) {
+                result.complete(new SubagentResult("error",
+                        List.of(new TextBlock("subagent execution failed: " + e.getMessage())),
+                        "exception"));
+                if (!ready.isDone()) {
+                    ready.completeExceptionally(e);
+                }
+            }
+        });
+
+        return ready;
+    }
+
+    private Process spawn(SubagentActivationSpec spec) throws IOException {
+        List<String> cmd = new ArrayList<>();
+        cmd.add(command);
+        cmd.addAll(args);
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        // 子进程目录：准入阶段解析出的子级工作目录优先，配置 cwd 兜底
+        String dir = (spec.resolvedCwd() != null && !spec.resolvedCwd().isBlank())
+                ? spec.resolvedCwd() : cwd;
+        if (dir != null) pb.directory(new File(dir));
+        pb.environment().putAll(env);
+        pb.redirectErrorStream(false);
+        return pb.start();
     }
 
     /**
      * 运行Child。
      */
-    private SubagentResult runChild(SubagentStartRequest request) {
-        List<String> cmd = new ArrayList<>();
-        cmd.add(command);
-        cmd.addAll(args);
-        ProcessBuilder pb = new ProcessBuilder(cmd);
-        if (cwd != null) pb.directory(new File(cwd));
-        pb.environment().putAll(env);
-        pb.redirectErrorStream(false);
-
+    private SubagentResult runChild(SubagentActivationSpec spec, Process process) {
         try {
-            Process process = pb.start();
-            String wireInput = encodePrompt(request);
+            String wireInput = encodePrompt(spec.request());
             process.getOutputStream().write(wireInput.getBytes(StandardCharsets.UTF_8));
             process.getOutputStream().close();
 
@@ -114,5 +146,63 @@ public abstract class OutOfProcessSubagentProvider implements SubagentProvider {
     /** Decode the child's stdout into content blocks. */
     protected List<ContentBlock> decodeOutput(String output) {
         return List.of(new TextBlock(output));
+    }
+
+    // ── Activation 句柄 ─────────────────────────────────────────
+
+    private final class ProcessActivation implements SubagentActivation {
+
+        private final SubagentActivationSpec spec;
+        private final CompletableFuture<SubagentResult> result;
+        private final AtomicReference<Process> processRef;
+
+        private ProcessActivation(SubagentActivationSpec spec,
+                                  CompletableFuture<SubagentResult> result,
+                                  AtomicReference<Process> processRef) {
+            this.spec = spec;
+            this.result = result;
+            this.processRef = processRef;
+        }
+
+        @Override
+        public String childId() {
+            return spec.childId();
+        }
+
+        @Override
+        public String label() {
+            return spec.label();
+        }
+
+        @Override
+        public String provider() {
+            return OutOfProcessSubagentProvider.this.name();
+        }
+
+        @Override
+        public String delivery() {
+            return spec.delivery();
+        }
+
+        @Override
+        public boolean continuable() {
+            return false;
+        }
+
+        @Override
+        public CompletableFuture<SubagentResult> result() {
+            return result;
+        }
+
+        @Override
+        public CompletableFuture<Void> dispose() {
+            return CompletableFuture.runAsync(() -> {
+                Process process = processRef.get();
+                if (process != null && process.isAlive()) {
+                    process.destroyForcibly();
+                }
+                // 拆解失败不覆盖已捕获结果：仅终止进程，结果 future 保持原状
+            }, executor);
+        }
     }
 }
