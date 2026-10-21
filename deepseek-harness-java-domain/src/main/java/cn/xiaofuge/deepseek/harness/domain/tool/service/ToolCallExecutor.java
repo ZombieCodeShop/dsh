@@ -210,18 +210,25 @@ public final class ToolCallExecutor {
                 turn, step, toolCalls.size(),
                 toolCalls.stream().map(ToolCallBlock::name).toList());
 
-        // 规划调用
+        // 规划调用：单个参数解析失败只让该调用失败，不打断整个回合
         List<PlannedCall> planned = new ArrayList<>();
         for (ToolCallBlock block : toolCalls) {
-            planned.add(new PlannedCall(block, argumentsParser.parse(block.arguments())));
+            try {
+                planned.add(new PlannedCall(block, argumentsParser.parse(block.arguments()), null));
+            } catch (RuntimeException e) {
+                planned.add(new PlannedCall(block, Map.of(),
+                        "Error: invalid tool arguments: " + e.getMessage()));
+            }
         }
 
         int next = 0;
         boolean concluded = false;
         while (next < planned.size()) {
             PlannedCall first = planned.get(next);
-            ToolExecutionMode mode = registry.executionMode(
-                    ToolExecutionInput.root(first.block.id(), first.block.name(), first.execArgs));
+            ToolExecutionMode mode = first.parseError() != null
+                    ? ToolExecutionMode.EXCLUSIVE
+                    : registry.executionMode(
+                            ToolExecutionInput.root(first.block.id(), first.block.name(), first.execArgs));
             List<PlannedCall> group = mode == ToolExecutionMode.PARALLEL
                     ? planned.subList(next, planned.size())
                     : List.of(first);
@@ -319,6 +326,7 @@ public final class ToolCallExecutor {
                 // 有序提交后重新读取后续调用模式
                 if (nextToStart > 0 && mode == ToolExecutionMode.PARALLEL) {
                     PlannedCall nextCall = group.get(nextToStart);
+                    if (nextCall.parseError() != null) break;
                     ToolExecutionMode recheck = registry.executionMode(
                             ToolExecutionInput.root(nextCall.block.id(), nextCall.block.name(), nextCall.execArgs));
                     if (recheck != ToolExecutionMode.PARALLEL) break;
@@ -326,6 +334,18 @@ public final class ToolCallExecutor {
 
                 int index = nextToStart;
                 PlannedCall call = group.get(index);
+
+                // 参数无法解析：不派发，但必须成对落库，把错误回给模型重试
+                if (call.parseError() != null) {
+                    log.warn("[Tool] Turn#{} Step#{} 工具 {} 参数解析失败，跳过执行",
+                            turn, step, call.block.name());
+                    callSeqs[index] = appendToolCall(turn, step, call.block);
+                    started++;
+                    slots[index] = new Slot(null,
+                            ToolExecutionResult.fail(call.parseError(), ToolErrorCodes.INVALID_ARGS), false);
+                    nextToStart++;
+                    continue;
+                }
 
                 // PRE_TOOL_USE Hook：被拦截时跳过工具
                 if (shouldBlock(call.block.name())) {
@@ -704,16 +724,26 @@ public final class ToolCallExecutor {
     }
 
     /**
+     * 为未执行的工具调用写入成对的 tool_call / tool_result 事件。
+     * <p>用于回合在中途结束（取消、模型报错、步骤异常）却已经落库了含 tool_use 的
+     * assistant 消息的场景：上游要求每个 tool_use 后紧跟对应的 tool_result，否则整段历史被拒。
+     */
+    public void appendNotExecuted(long turn, long step, List<ToolCallBlock> toolCalls, String reason) {
+        if (toolCalls == null || toolCalls.isEmpty()) return;
+        for (ToolCallBlock block : toolCalls) {
+            if (block == null || block.id() == null || block.id().isBlank()) continue;
+            long callSeq = appendToolCall(turn, step, block);
+            appendToolResult(turn, step, block,
+                    ToolExecutionResult.fail(reason, ToolErrorCodes.ABORTED_BEFORE_DISPATCH), callSeq);
+        }
+    }
+
+    /**
      * 为被取消或未派发的工具调用写入合成失败结果。
      * <p>这保证 tool_call 和 tool_result 在事件日志中成对出现，会话重建时不会出现悬挂调用。
      */
     private void appendSkippedToolCall(long turn, long step, ToolCallBlock block) {
-        long callSeq = appendToolCall(turn, step, block);
-        var result = ToolExecutionResult.fail(
-                "Error: tool call aborted before dispatch",
-                ToolErrorCodes.ABORTED_BEFORE_DISPATCH
-        );
-        appendToolResult(turn, step, block, result, callSeq);
+        appendNotExecuted(turn, step, List.of(block), "Error: tool call aborted before dispatch");
     }
 
     private String flattenToolResult(List<ContentBlock> blocks) {
@@ -749,7 +779,7 @@ public final class ToolCallExecutor {
     /**
      * 一次已解析参数、准备派发的工具调用。
      */
-    private record PlannedCall(ToolCallBlock block, Object execArgs) {}
+    private record PlannedCall(ToolCallBlock block, Object execArgs, String parseError) {}
 
     /**
      * 并行调度器中的一个结果槽位。

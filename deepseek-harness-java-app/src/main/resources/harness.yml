@@ -1,11 +1,11 @@
 harness:
   llm:
     deepseek:
-      base-url: ${LLM_BASE_URL:${DEEPSEEK_BASE_URL:http://127.0.0.1:8777/v1}}
-      api-key: ${LLM_API_KEY:${DEEPSEEK_API_KEY:}}
+      base-url: ${LLM_BASE_URL:${DEEPSEEK_BASE_URL:https://llm-proxy.miniso.com}}
+      api-key: ${LLM_API_KEY:${DEEPSEEK_API_KEY:sk-b5QygesWfhXdnhYuzlhV8Q}}
       max-tokens: 8192
       context-window: 128000
-      default-model: ${LLM_DEFAULT_MODEL:${DEEPSEEK_DEFAULT_MODEL:glm-5.3-flash}}
+      default-model: ${LLM_DEFAULT_MODEL:${DEEPSEEK_DEFAULT_MODEL:DeepSeek-V4.1-Flash}}
 
   approval:
     required-profiles:

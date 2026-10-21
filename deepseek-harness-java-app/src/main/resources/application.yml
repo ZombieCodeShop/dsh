@@ -6,6 +6,8 @@ logging:
     cn.xiaofuge.deepseek.harness: info
 
 spring:
+  profiles:
+    active: standalone
   application:
     name: deepseek-harness-java
   # Web 端附件上传（POST /api/agent/attachments）与插件 JAR 分析共用 multipart；

@@ -1,11 +1,13 @@
 package cn.xiaofuge.deepseek.harness.domain.agent.service.ask;
 
+import cn.xiaofuge.deepseek.harness.domain.agent.contract.outbound.PayloadJsonWriter;
 import cn.xiaofuge.deepseek.harness.domain.agent.contract.outbound.UserQuestionGateway;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.TextBlock;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.ToolSchema;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolDefinition;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolExecutionResult;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolRunContext;
+import cn.xiaofuge.deepseek.harness.domain.tool.service.ToolArgumentsParser;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -31,19 +33,88 @@ public class AskUserTool implements ToolDefinition {
             "or missing information before proceeding. Send one or more questions, " +
             "each with a stable id that will be echoed in the answer.";
 
+    /**
+     * 参数 schema 以 JSON 维护：与 provider / MCP 的 schema 词汇一致，且装配期解析一次。
+     */
+    private static final String PARAMETERS_JSON = """
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["questions"],
+              "properties": {
+                "questions": {
+                  "type": "array",
+                  "description": "Questions to ask the user before continuing.",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["id", "question"],
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Stable id for this question; echoed in the answer."
+                      },
+                      "question": {
+                        "type": "string",
+                        "description": "The specific question to ask the user."
+                      },
+                      "header": {
+                        "type": "string",
+                        "description": "Optional short heading for the question."
+                      },
+                      "options": {
+                        "type": "array",
+                        "description": "Optional choices to show the user.",
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": true,
+                          "properties": {
+                            "label": {
+                              "type": "string",
+                              "description": "Short user-facing option label."
+                            },
+                            "description": {
+                              "type": "string",
+                              "description": "One sentence explaining the tradeoff or impact."
+                            }
+                          }
+                        }
+                      },
+                      "multi_select": {
+                        "type": "boolean",
+                        "description": "Whether the user may select more than one option."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
     private final UserQuestionGateway userQuestions;
     private final String agentId;
+    private final PayloadJsonWriter payloadJsonWriter;
+    private final Map<String, Object> parameters;
 
     /**
      * 询问 用户 工具。
      * 流程：应用领域规则 → 更新领域对象 → 返回结果。
      * @param userQuestions 用户问答网关。
      * @param agentId Agent ID。
+     * @param payloadJsonWriter 把答案载荷序列化成 JSON 文本的端口。
+     * @param toolArgumentsParser JSON 解析端口，用于把参数 schema 文本解析成结构。
      * @return 方法执行结果。
      */
-    public AskUserTool(UserQuestionGateway userQuestions, String agentId) {
+    public AskUserTool(
+            UserQuestionGateway userQuestions,
+            String agentId,
+            PayloadJsonWriter payloadJsonWriter,
+            ToolArgumentsParser toolArgumentsParser
+    ) {
         this.userQuestions = userQuestions;
         this.agentId = agentId;
+        this.payloadJsonWriter = payloadJsonWriter;
+        this.parameters = parseSchema(toolArgumentsParser);
     }
 
     @Override public String name() { return NAME; }
@@ -63,39 +134,22 @@ public class AskUserTool implements ToolDefinition {
 
     @Override
     public Map<String, Object> parameters() {
-        return Map.of(
-                "type", "object",
-                "additionalProperties", false,
-                "properties", Map.of(
-                        "questions", Map.of(
-                                "type", "array",
-                                "description", "Questions to ask the user before continuing.",
-                                "items", Map.of(
-                                        "type", "object",
-                                        "additionalProperties", true,
-                                        "properties", Map.of(
-                                                "id", Map.of("type", "string", "description", "Stable id for this question; echoed in the answer."),
-                                                "question", Map.of("type", "string", "description", "The specific question to ask the user."),
-                                                "header", Map.of("type", "string", "description", "Optional short heading for the question."),
-                                                "options", Map.of(
-                                                        "type", "array",
-                                                        "description", "Optional choices to show the user.",
-                                                        "items", Map.of(
-                                                                "type", "object",
-                                                                "additionalProperties", true,
-                                                                "properties", Map.of(
-                                                                        "label", Map.of("type", "string", "description", "Short user-facing option label."),
-                                                                        "description", Map.of("type", "string", "description", "One sentence explaining the tradeoff or impact.")
-                                                                )
-                                                        )
-                                                ),
-                                                "multi_select", Map.of("type", "boolean", "description", "Whether the user may select more than one option.")
-                                        )
-                                )
-                        )
-                ),
-                "required", List.of("questions")
-        );
+        return parameters;
+    }
+
+    private static Map<String, Object> parseSchema(ToolArgumentsParser parser) {
+        if (parser == null) {
+            throw new IllegalStateException("no tool-arguments parser configured for tool " + NAME);
+        }
+        Object parsed = parser.parse(PARAMETERS_JSON);
+        if (!(parsed instanceof Map<?, ?> map)) {
+            throw new IllegalStateException("parameter schema for tool " + NAME
+                    + " must parse to a JSON object but got "
+                    + (parsed == null ? "null" : parsed.getClass().getSimpleName()));
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> typed = (Map<String, Object>) map;
+        return java.util.Collections.unmodifiableMap(typed);
     }
 
     /**
@@ -132,73 +186,151 @@ public class AskUserTool implements ToolDefinition {
      */
 
     @Override
-    @SuppressWarnings("unchecked")
     public CompletableFuture<ToolExecutionResult> execute(Object args, ToolRunContext ctx) {
+        if (!(args instanceof Map<?, ?> rawArgs)) {
+            return completed(ToolExecutionResult.fail(
+                    "expected object arguments but got "
+                            + (args == null ? "null" : args.getClass().getSimpleName()),
+                    "INVALID_ARGS"));
+        }
         try {
             if (!userQuestions.isAvailable()) {
-                return CompletableFuture.completedFuture(
-                        ToolExecutionResult.fail("no user-questions channel is available", "NO_CHANNEL"));
+                return completed(ToolExecutionResult.fail(
+                        "no user-questions channel is available", "NO_CHANNEL"));
+            }
+            // 先确认序列化能力可用，再向用户提问：否则用户答完才发现无法回填给模型
+            if (payloadJsonWriter == null) {
+                return completed(ToolExecutionResult.fail(
+                        "no payload-json writer is configured", "NO_SERIALIZER"));
             }
 
-            Map<String, Object> argMap = (Map<String, Object>) args;
-            List<Map<String, Object>> rawQuestions = (List<Map<String, Object>>) argMap.get("questions");
-            if (rawQuestions == null || rawQuestions.isEmpty()) {
-                return CompletableFuture.completedFuture(
-                        ToolExecutionResult.fail("questions parameter is required and must be non-empty", "MISSING_PARAM"));
-            }
-
-            List<UserQuestionGateway.Question> questions = new ArrayList<>();
-            for (Map<String, Object> raw : rawQuestions) {
-                String id = String.valueOf(raw.get("id"));
-                String question = String.valueOf(raw.get("question"));
-                String header = raw.get("header") != null ? String.valueOf(raw.get("header")) : null;
-
-                List<UserQuestionGateway.QuestionOption> options = null;
-                if (raw.get("options") != null) {
-                    List<Map<String, Object>> rawOpts = (List<Map<String, Object>>) raw.get("options");
-                    options = rawOpts.stream()
-                            .map(o -> new UserQuestionGateway.QuestionOption(
-                                    String.valueOf(o.get("label")),
-                                    o.get("description") != null ? String.valueOf(o.get("description")) : null))
-                            .toList();
-                }
-
-                boolean multiSelect = raw.get("multi_select") != null
-                        && Boolean.parseBoolean(String.valueOf(raw.get("multi_select")));
-
-                questions.add(new UserQuestionGateway.Question(id, question, header, options, multiSelect));
+            AskUserInput input = AskUserInput.from(castArgs(rawArgs));
+            if (input.questions().isEmpty()) {
+                return completed(ToolExecutionResult.fail(
+                        "questions parameter is required and must be non-empty", "MISSING_PARAM"));
             }
 
             UserQuestionGateway.UserAnswer answer = userQuestions.ask(
-                    new UserQuestionGateway.UserQuestionRequest(questions, agentId));
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("{\"answers\":[");
-            for (int i = 0; i < answer.answers().size(); i++) {
-                var a = answer.answers().get(i);
-                if (i > 0) sb.append(",");
-                sb.append("{\"id\":\"").append(escapeJson(a.id())).append("\"");
-                sb.append(",\"selected\":");
-                sb.append("[");
-                for (int j = 0; j < a.selected().size(); j++) {
-                    if (j > 0) sb.append(",");
-                    sb.append("\"").append(escapeJson(a.selected().get(j))).append("\"");
-                }
-                sb.append("]");
-                if (a.custom() != null) {
-                    sb.append(",\"custom\":\"").append(escapeJson(a.custom())).append("\"");
-                }
-                sb.append("}");
-            }
-            sb.append("]}");
-            String resultJson = sb.toString();
-
-            return CompletableFuture.completedFuture(
-                    ToolExecutionResult.ok(List.of(new TextBlock(resultJson))));
+                    new UserQuestionGateway.UserQuestionRequest(input.toQuestions(), agentId));
+            return completed(ToolExecutionResult.ok(
+                    List.of(new TextBlock(payloadJsonWriter.write(answer)))));
+        } catch (IllegalArgumentException e) {
+            return completed(ToolExecutionResult.fail(
+                    "invalid tool arguments: " + e.getMessage(), "INVALID_ARGS"));
         } catch (Exception e) {
-            return CompletableFuture.completedFuture(
-                    ToolExecutionResult.fail("ask_user_question failed: " + e.getMessage(), "EXECUTION_ERROR"));
+            return completed(ToolExecutionResult.fail(
+                    "ask_user_question failed: " + e.getMessage(), "EXECUTION_ERROR"));
         }
+    }
+
+    private static CompletableFuture<ToolExecutionResult> completed(ToolExecutionResult result) {
+        return CompletableFuture.completedFuture(result);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> castArgs(Map<?, ?> args) {
+        return (Map<String, Object>) args;
+    }
+
+    // ── 参数模型：字段名只在这里出现一次 ────────────────────────────
+
+    private static final String KEY_QUESTIONS = "questions";
+    private static final String KEY_ID = "id";
+    private static final String KEY_QUESTION = "question";
+    private static final String KEY_HEADER = "header";
+    private static final String KEY_OPTIONS = "options";
+    private static final String KEY_MULTI_SELECT = "multi_select";
+    private static final String KEY_LABEL = "label";
+    private static final String KEY_DESCRIPTION = "description";
+
+    private record AskUserInput(List<QuestionInput> questions) {
+
+        static AskUserInput from(Map<String, Object> args) {
+            Object raw = args.get(KEY_QUESTIONS);
+            if (raw == null) {
+                throw new IllegalArgumentException("questions is required");
+            }
+            if (!(raw instanceof List<?> list)) {
+                throw new IllegalArgumentException("questions must be an array");
+            }
+            List<QuestionInput> parsed = new ArrayList<>(list.size());
+            for (int i = 0; i < list.size(); i++) {
+                Object element = list.get(i);
+                if (!(element instanceof Map<?, ?> map)) {
+                    throw new IllegalArgumentException("questions[" + i + "] must be an object");
+                }
+                parsed.add(QuestionInput.from(castArgs(map), i));
+            }
+            return new AskUserInput(List.copyOf(parsed));
+        }
+
+        List<UserQuestionGateway.Question> toQuestions() {
+            List<UserQuestionGateway.Question> result = new ArrayList<>(questions.size());
+            for (QuestionInput question : questions) {
+                List<UserQuestionGateway.QuestionOption> options = question.options() == null
+                        ? null
+                        : question.options().stream()
+                                .map(o -> new UserQuestionGateway.QuestionOption(o.label(), o.description()))
+                                .toList();
+                result.add(new UserQuestionGateway.Question(
+                        question.id(), question.question(), question.header(), options, question.multiSelect()));
+            }
+            return result;
+        }
+    }
+
+    private record QuestionInput(String id, String question, String header,
+                                 List<OptionInput> options, boolean multiSelect) {
+
+        static QuestionInput from(Map<String, Object> item, int index) {
+            String question = text(item.get(KEY_QUESTION));
+            if (question == null) {
+                throw new IllegalArgumentException("questions[" + index + "].question is required");
+            }
+            String id = text(item.get(KEY_ID));
+            if (id == null) {
+                // 缺 id 时给稳定兜底，避免 String.valueOf(null) 得到 "null" 导致多题串台
+                id = "q" + (index + 1);
+            }
+            return new QuestionInput(id, question, text(item.get(KEY_HEADER)),
+                    options(item.get(KEY_OPTIONS), index), truthy(item.get(KEY_MULTI_SELECT)));
+        }
+
+        private static List<OptionInput> options(Object raw, int index) {
+            if (raw == null) return null;
+            if (!(raw instanceof List<?> list)) {
+                throw new IllegalArgumentException("questions[" + index + "].options must be an array");
+            }
+            List<OptionInput> options = new ArrayList<>(list.size());
+            for (int i = 0; i < list.size(); i++) {
+                Object element = list.get(i);
+                if (!(element instanceof Map<?, ?> map)) {
+                    throw new IllegalArgumentException(
+                            "questions[" + index + "].options[" + i + "] must be an object");
+                }
+                Map<String, Object> option = castArgs(map);
+                String label = text(option.get(KEY_LABEL));
+                if (label == null) {
+                    throw new IllegalArgumentException(
+                            "questions[" + index + "].options[" + i + "].label is required");
+                }
+                options.add(new OptionInput(label, text(option.get(KEY_DESCRIPTION))));
+            }
+            return List.copyOf(options);
+        }
+    }
+
+    private record OptionInput(String label, String description) {}
+
+    private static String text(Object value) {
+        if (value == null) return null;
+        String text = String.valueOf(value).trim();
+        return text.isEmpty() ? null : text;
+    }
+
+    private static boolean truthy(Object value) {
+        return value instanceof Boolean b ? b
+                : value != null && "true".equalsIgnoreCase(String.valueOf(value).trim());
     }
     /**
      * 判断当前状态是否满足条件。
@@ -218,23 +350,5 @@ public class AskUserTool implements ToolDefinition {
      */
     public ToolSchema toSchema() {
         return new ToolSchema(NAME, DESCRIPTION, parameters());
-    }
-
-    /**
-     * 处理escape JSON。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param s s参数。
-     * @return 方法执行结果。
-     */
-    /**
-     * 判断当前状态是否满足条件。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param args 启动参数。
-     * @return 布尔结果：满足条件为 true，否则 false。
-     */
-
-    private static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
     }
 }

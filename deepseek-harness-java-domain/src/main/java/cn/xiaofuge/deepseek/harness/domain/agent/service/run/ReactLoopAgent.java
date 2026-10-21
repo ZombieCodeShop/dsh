@@ -32,9 +32,11 @@ import cn.xiaofuge.deepseek.harness.domain.session.event.service.SessionEventFac
 import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolRegistry;
 import cn.xiaofuge.deepseek.harness.domain.tool.service.ToolCallExecutor;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -539,6 +541,8 @@ public class ReactLoopAgent implements AgentRun {
         log.info("[step] ▷ Agent={} Turn#{} Step#{} 开始执行（model={}，工具数={}）",
                 id, turn, step, options.model(), resolveToolSchemas().size());
         long stepStart = System.currentTimeMillis();
+        // assistant 消息先落库、工具后执行：中途结束时用它补写未执行调用的结果，避免留下孤儿 tool_use
+        List<ToolCallBlock> pendingToolCalls = List.of();
         try {
             // 1. 组装系统提示词
             long assembleStart = System.currentTimeMillis();
@@ -713,21 +717,28 @@ public class ReactLoopAgent implements AgentRun {
 
             // 非错误场景下，记录 assistant/message（surface event）
             session.append(SessionEventFactory.assistantMessage(turn, step, assistantMsg, usage));
+            pendingToolCalls = blocks.stream()
+                    .filter(b -> b instanceof ToolCallBlock)
+                    .map(b -> (ToolCallBlock) b)
+                    .toList();
 
             if (finish instanceof FinishReason.MaxTokens) {
                 log.info("[step] ↻ Agent={} Turn#{} Step#{} 输出达到 token 上限", id, turn, step);
+                toolExecutor.appendNotExecuted(turn, step, pendingToolCalls,
+                        "Error: output truncated before tool execution");
+                pendingToolCalls = List.of();
                 return new TurnEndReason.MaxTokens();
             }
             if (finish instanceof FinishReason.Aborted) {
                 log.info("[step] ⚠ Agent={} Turn#{} Step#{} 流被中止", id, turn, step);
+                toolExecutor.appendNotExecuted(turn, step, pendingToolCalls,
+                        "Error: stream aborted before tool execution");
+                pendingToolCalls = List.of();
                 return new TurnEndReason.Aborted("stream aborted");
             }
 
             // 7. 检查是否有工具调用
-            List<ToolCallBlock> toolCalls = blocks.stream()
-                    .filter(b -> b instanceof ToolCallBlock)
-                    .map(b -> (ToolCallBlock) b)
-                    .toList();
+            List<ToolCallBlock> toolCalls = pendingToolCalls;
 
             if (toolCalls.isEmpty()) {
                 log.info("[step] ◁ Agent={} Turn#{} Step#{} 完成，无工具调用，耗时={}ms",
@@ -752,6 +763,7 @@ public class ReactLoopAgent implements AgentRun {
             }
             log.info("[step] 🔧 Agent={} Turn#{} Step#{} 开始执行工具调用...", id, turn, step);
             toolExecutor.execute(turn, step, toolCalls, running.abort(), null);
+            pendingToolCalls = List.of(); // 结果已由执行器成对写入
             log.info("[step] 🔧 Agent={} Turn#{} Step#{} 工具调用执行完成，耗时={}ms，续步推理",
                     id, turn, step, System.currentTimeMillis() - stepStart);
 
@@ -766,6 +778,10 @@ public class ReactLoopAgent implements AgentRun {
         } catch (Exception e) {
             log.error("[step] ✗ Agent={} Turn#{} Step#{} 执行异常：{}",
                     id, turn, step, e.getMessage(), e);
+            toolExecutor.appendNotExecuted(turn, step, pendingToolCalls,
+                    "Error: step failed before tool execution: "
+                            + (e.getMessage() != null ? e.getMessage() : e.toString()));
+            pendingToolCalls = List.of();
             return new TurnEndReason.Error(
                     e.getMessage() != null ? e.getMessage() : e.toString(),
                     "STEP_ERROR");
@@ -829,6 +845,8 @@ public class ReactLoopAgent implements AgentRun {
         int budget = maxContext - systemTokens - options.maxTokens() - 1024;
         if (budget < 4096) budget = 4096;
         history = truncateToBudget(history, budget);
+        // 截断可能切在 tool_use 与 tool_result 之间，必须修复配对后再发给上游
+        history = repairToolPairing(history);
         return new GenerateOptions(
                 options.provider(),
                 options.model(),
@@ -911,6 +929,111 @@ public class ReactLoopAgent implements AgentRun {
             }
         }
         return java.util.Collections.unmodifiableList(kept);
+    }
+
+    /**
+     * 修复历史中的 tool_use / tool_result 配对。
+     * <p>上游要求每个 tool_use 之后紧邻的消息里必须有对应的 tool_result，否则整段历史被拒、
+     * 且该错误会随历史一直复现。这里处理两类损坏：tool_use 缺结果（补合成失败结果）、
+     * 结果缺 tool_use（丢弃）。方法幂等，对已配对的历史原样返回。
+     */
+    static List<Message> repairToolPairing(List<Message> history) {
+        if (history == null || history.isEmpty()) return history;
+
+        // 1) tool_use 缺结果 → 合并进紧随其后的第一条 tool 消息，没有则插一条
+        List<Message> filled = new ArrayList<>(history.size() + 2);
+        int i = 0;
+        while (i < history.size()) {
+            Message current = history.get(i);
+            filled.add(current);
+            List<String> callIds = toolCallIds(current);
+            if (callIds.isEmpty()) {
+                i++;
+                continue;
+            }
+
+            // 连续的 tool 消息在适配器侧都会映射为紧随其后的 tool_result 块
+            int next = i + 1;
+            Set<String> satisfied = new LinkedHashSet<>();
+            while (next < history.size() && "tool".equals(history.get(next).role())) {
+                satisfied.addAll(toolResultIds(history.get(next)));
+                next++;
+            }
+
+            List<ContentBlock> missing = new ArrayList<>();
+            for (String callId : callIds) {
+                if (satisfied.contains(callId)) continue;
+                missing.add(new ToolResultBlock(callId,
+                        List.of(new TextBlock(
+                                "Error: tool result missing; the call was interrupted or history was truncated.")),
+                        true));
+            }
+
+            if (next > i + 1) {
+                Message first = history.get(i + 1);
+                if (!missing.isEmpty()) {
+                    List<ContentBlock> merged = new ArrayList<>(first.content());
+                    merged.addAll(missing);
+                    filled.add(new Message(first.id(), first.role(), merged, first.source()));
+                } else {
+                    filled.add(first);
+                }
+                for (int k = i + 2; k < next; k++) filled.add(history.get(k));
+            } else if (!missing.isEmpty()) {
+                filled.add(new Message(
+                        java.util.UUID.randomUUID().toString(),
+                        "tool",
+                        missing,
+                        new MessageSource.ToolMessageSource(callIds.get(0))));
+            }
+            i = next;
+        }
+
+        // 2) 结果缺 tool_use → 丢弃，避免上游报 unexpected tool_result
+        List<Message> out = new ArrayList<>(filled.size());
+        Set<String> allowedCallIds = Set.of();
+        for (Message message : filled) {
+            if ("assistant".equals(message.role())) {
+                List<String> callIds = toolCallIds(message);
+                allowedCallIds = callIds.isEmpty() ? Set.of() : new LinkedHashSet<>(callIds);
+                out.add(message);
+            } else if (!"tool".equals(message.role())) {
+                allowedCallIds = Set.of();
+                out.add(message);
+            } else {
+                List<ContentBlock> kept = new ArrayList<>();
+                for (ContentBlock block : message.content()) {
+                    if (block instanceof ToolResultBlock result && allowedCallIds.contains(result.toolCallId())) {
+                        kept.add(block);
+                    }
+                }
+                if (kept.isEmpty()) continue;
+                out.add(kept.size() == message.content().size()
+                        ? message
+                        : new Message(message.id(), message.role(), kept, message.source()));
+            }
+        }
+        return out;
+    }
+
+    private static List<String> toolCallIds(Message message) {
+        if (message == null || !"assistant".equals(message.role())) return List.of();
+        List<String> ids = new ArrayList<>();
+        for (ContentBlock block : message.content()) {
+            if (block instanceof ToolCallBlock call && call.id() != null && !call.id().isBlank()) {
+                ids.add(call.id());
+            }
+        }
+        return ids;
+    }
+
+    private static Set<String> toolResultIds(Message message) {
+        if (message == null) return Set.of();
+        Set<String> ids = new LinkedHashSet<>();
+        for (ContentBlock block : message.content()) {
+            if (block instanceof ToolResultBlock result) ids.add(result.toolCallId());
+        }
+        return ids;
     }
 
     /**

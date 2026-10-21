@@ -24,6 +24,7 @@ import cn.xiaofuge.deepseek.harness.domain.agent.service.SystemPromptAssembler;
 import cn.xiaofuge.deepseek.harness.domain.agent.service.ScopedSystemPromptAssembler;
 import cn.xiaofuge.deepseek.harness.domain.agent.service.subagent.SubagentRegistry;
 import cn.xiaofuge.deepseek.harness.domain.agent.service.subagent.SpawnInProcessProvider;
+import cn.xiaofuge.deepseek.harness.infrastructure.adapter.port.JacksonPayloadJsonWriter;
 import cn.xiaofuge.deepseek.harness.domain.runtime.setting.service.AgentModelSettingResolver;
 import cn.xiaofuge.deepseek.harness.domain.goal.IGoalCommandService;
 import cn.xiaofuge.deepseek.harness.domain.goal.IGoalQueryService;
@@ -270,7 +271,9 @@ public class AgentRunBeanConfig {
                 conversationQueryService,
                 terminalPort,
                 pluginRepository,
-                pluginRuntimeService
+                pluginRuntimeService,
+                new JacksonPayloadJsonWriter(objectMapper),
+                toolArgumentsParser
         );
 
         AgentRunFactory factory = new AgentRunFactory(

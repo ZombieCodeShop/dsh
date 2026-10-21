@@ -1328,8 +1328,13 @@ function renderMain() {
     main.appendChild(renderApprovalBanner());
   }
   // 运行期问答卡（ask_user_question）：挂在 Composer 上方，与审批横幅同级
-  for (const q of state.pendingQuestions) {
-    main.appendChild(renderQuestionCard(q));
+  // 多个待答问题时整体包一层可收缩容器，避免把提交按钮和输入框挤出可视区
+  if (state.pendingQuestions.length > 0) {
+    const questionStack = el('div', { class: 'question-stack' });
+    for (const q of state.pendingQuestions) {
+      questionStack.appendChild(renderQuestionCard(q));
+    }
+    main.appendChild(questionStack);
   }
   main.appendChild(renderComposer(sess));
 

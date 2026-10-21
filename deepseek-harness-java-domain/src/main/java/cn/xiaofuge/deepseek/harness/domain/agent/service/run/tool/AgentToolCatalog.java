@@ -1,5 +1,6 @@
 package cn.xiaofuge.deepseek.harness.domain.agent.service.run.tool;
 
+import cn.xiaofuge.deepseek.harness.domain.agent.contract.outbound.PayloadJsonWriter;
 import cn.xiaofuge.deepseek.harness.domain.agent.contract.outbound.UserQuestionGateway;
 import cn.xiaofuge.deepseek.harness.domain.agent.model.entity.AgentOptions;
 import cn.xiaofuge.deepseek.harness.domain.agent.service.ask.AskUserTool;
@@ -18,6 +19,7 @@ import cn.xiaofuge.deepseek.harness.domain.session.IConversationQueryService;
 import cn.xiaofuge.deepseek.harness.domain.todo.service.TodoWriteService;
 import cn.xiaofuge.deepseek.harness.domain.todo.service.TodoWriteTool;
 import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolRegistry;
+import cn.xiaofuge.deepseek.harness.domain.tool.service.ToolArgumentsParser;
 import cn.xiaofuge.deepseek.harness.domain.tool.fs.CwdResolvingFsPort;
 import cn.xiaofuge.deepseek.harness.domain.tool.fs.FsEditTool;
 import cn.xiaofuge.deepseek.harness.domain.tool.fs.FsGrepTool;
@@ -70,6 +72,8 @@ public final class AgentToolCatalog {
     private final cn.xiaofuge.deepseek.harness.domain.terminal.adapter.port.ITerminalPort terminalPort;
     private final IHarnessPluginRepository pluginRepository;
     private final IPluginRuntimeService pluginRuntimeService;
+    private final PayloadJsonWriter payloadJsonWriter;
+    private final ToolArgumentsParser toolArgumentsParser;
 
     public AgentToolCatalog(
             IShellExecutor shellExecutor,
@@ -89,7 +93,9 @@ public final class AgentToolCatalog {
             IConversationQueryService conversationQueryService,
             cn.xiaofuge.deepseek.harness.domain.terminal.adapter.port.ITerminalPort terminalPort,
             IHarnessPluginRepository pluginRepository,
-            IPluginRuntimeService pluginRuntimeService
+            IPluginRuntimeService pluginRuntimeService,
+            PayloadJsonWriter payloadJsonWriter,
+            ToolArgumentsParser toolArgumentsParser
     ) {
         this.shellExecutor = shellExecutor;
         this.fsPort = fsPort;
@@ -109,6 +115,8 @@ public final class AgentToolCatalog {
         this.terminalPort = terminalPort;
         this.pluginRepository = pluginRepository;
         this.pluginRuntimeService = pluginRuntimeService;
+        this.payloadJsonWriter = payloadJsonWriter;
+        this.toolArgumentsParser = toolArgumentsParser;
     }
 
     public ToolRegistry createRegistry(AgentToolContext context, ToolRegistry sharedRegistry) {
@@ -135,7 +143,8 @@ public final class AgentToolCatalog {
                 : () -> context.cwd();
 
         localRegistry.register(new TodoWriteTool(context.session(), false, todoWriteService));
-        localRegistry.register(new AskUserTool(context.userQuestions(), context.agentId()));
+        localRegistry.register(new AskUserTool(
+                context.userQuestions(), context.agentId(), payloadJsonWriter, toolArgumentsParser));
         localRegistry.register(new ExitPlanModeTool(context.session(), planState, planModeService));
         localRegistry.register(new ShellExecuteTool(
                 effectiveShellExecutor,

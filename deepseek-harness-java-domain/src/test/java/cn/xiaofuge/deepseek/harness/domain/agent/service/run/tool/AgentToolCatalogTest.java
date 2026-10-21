@@ -5,7 +5,10 @@ import cn.xiaofuge.deepseek.harness.domain.skill.model.entity.SkillDefinition;
 import cn.xiaofuge.deepseek.harness.domain.skill.model.entity.SkillSummary;
 import cn.xiaofuge.deepseek.harness.domain.skill.model.valobj.SkillInvocationPolicy;
 import cn.xiaofuge.deepseek.harness.domain.skill.model.valobj.SkillSource;
+import cn.xiaofuge.deepseek.harness.domain.tool.service.ToolArgumentsParser;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
@@ -16,7 +19,7 @@ class AgentToolCatalogTest {
     void exposesSkillToolWhenSkillServiceIsConfigured() {
         AgentToolCatalog catalog = new AgentToolCatalog(
                 null, null, null, null, null, null, null, null, skillService(),
-                null, null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null, null, jsonParser());
 
         var registry = catalog.createRegistry(
                 new AgentToolCatalog.AgentToolContext("agent", "session", null, null, null),
@@ -24,6 +27,16 @@ class AgentToolCatalogTest {
 
         assertTrue(registry.lookup("skill").isPresent());
         assertTrue(registry.lookup("plugin_status").isPresent());
+    }
+
+    private static ToolArgumentsParser jsonParser() {
+        return arguments -> {
+            try {
+                return new ObjectMapper().readValue(arguments, Map.class);
+            } catch (Exception e) {
+                throw new IllegalArgumentException(e);
+            }
+        };
     }
 
     private ISkillService skillService() {
