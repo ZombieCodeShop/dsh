@@ -5,7 +5,7 @@ import cn.xiaofuge.deepseek.harness.domain.skill.model.entity.SkillDefinition;
 import cn.xiaofuge.deepseek.harness.domain.skill.model.entity.SkillSummary;
 import cn.xiaofuge.deepseek.harness.domain.skill.model.valobj.SkillInvocationPolicy;
 import cn.xiaofuge.deepseek.harness.domain.skill.model.valobj.SkillSource;
-import cn.xiaofuge.deepseek.harness.domain.tool.service.ToolArgumentsParser;
+import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolJsonCodec;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import java.util.Map;
@@ -19,7 +19,7 @@ class AgentToolCatalogTest {
     void exposesSkillToolWhenSkillServiceIsConfigured() {
         AgentToolCatalog catalog = new AgentToolCatalog(
                 null, null, null, null, null, null, null, null, skillService(),
-                null, null, null, null, null, null, null, null, null, null, jsonParser());
+                null, null, null, null, null, null, null, null, null, jsonCodec());
 
         var registry = catalog.createRegistry(
                 new AgentToolCatalog.AgentToolContext("agent", "session", null, null, null),
@@ -29,12 +29,30 @@ class AgentToolCatalogTest {
         assertTrue(registry.lookup("plugin_status").isPresent());
     }
 
-    private static ToolArgumentsParser jsonParser() {
-        return arguments -> {
-            try {
-                return new ObjectMapper().readValue(arguments, Map.class);
-            } catch (Exception e) {
-                throw new IllegalArgumentException(e);
+    private static ToolJsonCodec jsonCodec() {
+        ObjectMapper mapper = new ObjectMapper();
+        return new ToolJsonCodec() {
+            @Override
+            public String write(Object payload) {
+                try {
+                    return mapper.writeValueAsString(payload);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+
+            @Override
+            public Object parse(String json) {
+                try {
+                    return mapper.readValue(json, Object.class);
+                } catch (Exception e) {
+                    throw new IllegalArgumentException(e);
+                }
+            }
+
+            @Override
+            public <T> T convert(Object args, Class<T> type) {
+                return mapper.convertValue(args, type);
             }
         };
     }

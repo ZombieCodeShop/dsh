@@ -1,13 +1,12 @@
 package cn.xiaofuge.deepseek.harness.domain.agent.service.ask;
 
-import cn.xiaofuge.deepseek.harness.domain.agent.contract.outbound.PayloadJsonWriter;
 import cn.xiaofuge.deepseek.harness.domain.agent.contract.outbound.UserQuestionGateway;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.TextBlock;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.ToolSchema;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolDefinition;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolExecutionResult;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolRunContext;
-import cn.xiaofuge.deepseek.harness.domain.tool.service.ToolArgumentsParser;
+import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolJsonCodec;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -93,7 +92,7 @@ public class AskUserTool implements ToolDefinition {
 
     private final UserQuestionGateway userQuestions;
     private final String agentId;
-    private final PayloadJsonWriter payloadJsonWriter;
+    private final ToolJsonCodec codec;
     private final Map<String, Object> parameters;
 
     /**
@@ -101,20 +100,18 @@ public class AskUserTool implements ToolDefinition {
      * 流程：应用领域规则 → 更新领域对象 → 返回结果。
      * @param userQuestions 用户问答网关。
      * @param agentId Agent ID。
-     * @param payloadJsonWriter 把答案载荷序列化成 JSON 文本的端口。
-     * @param toolArgumentsParser JSON 解析端口，用于把参数 schema 文本解析成结构。
+     * @param codec 工具侧 JSON 能力端口（写结果 / 解 schema / 转类型化入参）。
      * @return 方法执行结果。
      */
     public AskUserTool(
             UserQuestionGateway userQuestions,
             String agentId,
-            PayloadJsonWriter payloadJsonWriter,
-            ToolArgumentsParser toolArgumentsParser
+            ToolJsonCodec codec
     ) {
         this.userQuestions = userQuestions;
         this.agentId = agentId;
-        this.payloadJsonWriter = payloadJsonWriter;
-        this.parameters = parseSchema(toolArgumentsParser);
+        this.codec = codec;
+        this.parameters = parseSchema(codec);
     }
 
     @Override public String name() { return NAME; }
@@ -137,11 +134,11 @@ public class AskUserTool implements ToolDefinition {
         return parameters;
     }
 
-    private static Map<String, Object> parseSchema(ToolArgumentsParser parser) {
-        if (parser == null) {
-            throw new IllegalStateException("no tool-arguments parser configured for tool " + NAME);
+    private static Map<String, Object> parseSchema(ToolJsonCodec codec) {
+        if (codec == null) {
+            throw new IllegalStateException("no tool-json codec configured for tool " + NAME);
         }
-        Object parsed = parser.parse(PARAMETERS_JSON);
+        Object parsed = codec.parse(PARAMETERS_JSON);
         if (!(parsed instanceof Map<?, ?> map)) {
             throw new IllegalStateException("parameter schema for tool " + NAME
                     + " must parse to a JSON object but got "
@@ -198,13 +195,7 @@ public class AskUserTool implements ToolDefinition {
                 return completed(ToolExecutionResult.fail(
                         "no user-questions channel is available", "NO_CHANNEL"));
             }
-            // 先确认序列化能力可用，再向用户提问：否则用户答完才发现无法回填给模型
-            if (payloadJsonWriter == null) {
-                return completed(ToolExecutionResult.fail(
-                        "no payload-json writer is configured", "NO_SERIALIZER"));
-            }
-
-            AskUserInput input = AskUserInput.from(castArgs(rawArgs));
+            AskUserInput input = codec.convert(castArgs(rawArgs), AskUserInput.class);
             if (input.questions().isEmpty()) {
                 return completed(ToolExecutionResult.fail(
                         "questions parameter is required and must be non-empty", "MISSING_PARAM"));
@@ -213,7 +204,7 @@ public class AskUserTool implements ToolDefinition {
             UserQuestionGateway.UserAnswer answer = userQuestions.ask(
                     new UserQuestionGateway.UserQuestionRequest(input.toQuestions(), agentId));
             return completed(ToolExecutionResult.ok(
-                    List.of(new TextBlock(payloadJsonWriter.write(answer)))));
+                    List.of(new TextBlock(codec.write(answer)))));
         } catch (IllegalArgumentException e) {
             return completed(ToolExecutionResult.fail(
                     "invalid tool arguments: " + e.getMessage(), "INVALID_ARGS"));
@@ -232,105 +223,51 @@ public class AskUserTool implements ToolDefinition {
         return (Map<String, Object>) args;
     }
 
-    // ── 参数模型：字段名只在这里出现一次 ────────────────────────────
-
-    private static final String KEY_QUESTIONS = "questions";
-    private static final String KEY_ID = "id";
-    private static final String KEY_QUESTION = "question";
-    private static final String KEY_HEADER = "header";
-    private static final String KEY_OPTIONS = "options";
-    private static final String KEY_MULTI_SELECT = "multi_select";
-    private static final String KEY_LABEL = "label";
-    private static final String KEY_DESCRIPTION = "description";
+    // ── 参数模型：由 codec 直接反序列化，字段名只在 record 组件里出现一次 ──
 
     private record AskUserInput(List<QuestionInput> questions) {
-
-        static AskUserInput from(Map<String, Object> args) {
-            Object raw = args.get(KEY_QUESTIONS);
-            if (raw == null) {
-                throw new IllegalArgumentException("questions is required");
-            }
-            if (!(raw instanceof List<?> list)) {
-                throw new IllegalArgumentException("questions must be an array");
-            }
-            List<QuestionInput> parsed = new ArrayList<>(list.size());
-            for (int i = 0; i < list.size(); i++) {
-                Object element = list.get(i);
-                if (!(element instanceof Map<?, ?> map)) {
-                    throw new IllegalArgumentException("questions[" + i + "] must be an object");
-                }
-                parsed.add(QuestionInput.from(castArgs(map), i));
-            }
-            return new AskUserInput(List.copyOf(parsed));
+        AskUserInput {
+            questions = questions == null ? List.of() : List.copyOf(questions);
         }
 
         List<UserQuestionGateway.Question> toQuestions() {
             List<UserQuestionGateway.Question> result = new ArrayList<>(questions.size());
-            for (QuestionInput question : questions) {
+            for (int i = 0; i < questions.size(); i++) {
+                QuestionInput question = questions.get(i);
                 List<UserQuestionGateway.QuestionOption> options = question.options() == null
                         ? null
                         : question.options().stream()
                                 .map(o -> new UserQuestionGateway.QuestionOption(o.label(), o.description()))
                                 .toList();
+                String id = question.id() != null ? question.id() : "q" + (i + 1);
                 result.add(new UserQuestionGateway.Question(
-                        question.id(), question.question(), question.header(), options, question.multiSelect()));
+                        id, question.question(), question.header(), options, question.multi_select()));
             }
             return result;
         }
     }
 
     private record QuestionInput(String id, String question, String header,
-                                 List<OptionInput> options, boolean multiSelect) {
-
-        static QuestionInput from(Map<String, Object> item, int index) {
-            String question = text(item.get(KEY_QUESTION));
-            if (question == null) {
-                throw new IllegalArgumentException("questions[" + index + "].question is required");
+                                 List<OptionInput> options, boolean multi_select) {
+        QuestionInput {
+            question = question == null ? null : question.trim();
+            if (question == null || question.isEmpty()) {
+                throw new IllegalArgumentException("question is required");
             }
-            String id = text(item.get(KEY_ID));
-            if (id == null) {
-                // 缺 id 时给稳定兜底，避免 String.valueOf(null) 得到 "null" 导致多题串台
-                id = "q" + (index + 1);
-            }
-            return new QuestionInput(id, question, text(item.get(KEY_HEADER)),
-                    options(item.get(KEY_OPTIONS), index), truthy(item.get(KEY_MULTI_SELECT)));
-        }
-
-        private static List<OptionInput> options(Object raw, int index) {
-            if (raw == null) return null;
-            if (!(raw instanceof List<?> list)) {
-                throw new IllegalArgumentException("questions[" + index + "].options must be an array");
-            }
-            List<OptionInput> options = new ArrayList<>(list.size());
-            for (int i = 0; i < list.size(); i++) {
-                Object element = list.get(i);
-                if (!(element instanceof Map<?, ?> map)) {
-                    throw new IllegalArgumentException(
-                            "questions[" + index + "].options[" + i + "] must be an object");
-                }
-                Map<String, Object> option = castArgs(map);
-                String label = text(option.get(KEY_LABEL));
-                if (label == null) {
-                    throw new IllegalArgumentException(
-                            "questions[" + index + "].options[" + i + "].label is required");
-                }
-                options.add(new OptionInput(label, text(option.get(KEY_DESCRIPTION))));
-            }
-            return List.copyOf(options);
+            id = id == null || id.isBlank() ? null : id.trim();
+            header = header == null || header.isBlank() ? null : header.trim();
+            options = options == null ? null : List.copyOf(options);
         }
     }
 
-    private record OptionInput(String label, String description) {}
-
-    private static String text(Object value) {
-        if (value == null) return null;
-        String text = String.valueOf(value).trim();
-        return text.isEmpty() ? null : text;
-    }
-
-    private static boolean truthy(Object value) {
-        return value instanceof Boolean b ? b
-                : value != null && "true".equalsIgnoreCase(String.valueOf(value).trim());
+    private record OptionInput(String label, String description) {
+        OptionInput {
+            label = label == null ? null : label.trim();
+            if (label == null || label.isEmpty()) {
+                throw new IllegalArgumentException("option label is required");
+            }
+            description = description == null || description.isBlank() ? null : description.trim();
+        }
     }
     /**
      * 判断当前状态是否满足条件。

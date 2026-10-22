@@ -7,6 +7,8 @@ import cn.xiaofuge.deepseek.harness.domain.agent.service.subagent.SubagentProvid
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolExecutionResult;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolRunContext;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.TextBlock;
+import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolJsonCodec;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -29,6 +31,33 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * prompt 校验、error/aborted 停止原因到工具失败的映射、激活异常兜底。</p>
  */
 class SubagentToolDeliveryTest {
+
+    private static final ToolJsonCodec CODEC = new ToolJsonCodec() {
+        private final ObjectMapper mapper = new ObjectMapper();
+
+        @Override
+        public String write(Object payload) {
+            try {
+                return mapper.writeValueAsString(payload);
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        @Override
+        public Object parse(String json) {
+            try {
+                return mapper.readValue(json, Object.class);
+            } catch (Exception e) {
+                throw new IllegalArgumentException(e);
+            }
+        }
+
+        @Override
+        public <T> T convert(Object args, Class<T> type) {
+            return mapper.convertValue(args, type);
+        }
+    };
 
     /** 记录收到的 spec，可编程返回结果。 */
     private static final class RecordingProvider implements SubagentProvider {
@@ -90,7 +119,7 @@ class SubagentToolDeliveryTest {
                 new SubagentProvider.SubagentCapabilities(false, false, true));
         registry.register(provider);
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute(
                 Map.of("prompt", "refactor module X"), runContext()).join();
 
@@ -117,7 +146,8 @@ class SubagentToolDeliveryTest {
                 () -> null,                      // parentOptions
                 () -> "session-parent-7",        // parentSessionId
                 () -> "/tmp/proj",               // parentCwd
-                2                                // delegationDepth
+                2,                               // delegationDepth
+                CODEC
         );
         tool.execute(Map.of("prompt", "task"), runContext()).join();
 
@@ -134,7 +164,7 @@ class SubagentToolDeliveryTest {
                 new SubagentProvider.SubagentCapabilities(false, false, true));
         registry.register(provider);
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         tool.execute(Map.of("prompt", "task", "cwd", "packages/app"), runContext()).join();
 
         assertEquals("packages/app", provider.specs.get(0).request().requestCwd());
@@ -150,7 +180,7 @@ class SubagentToolDeliveryTest {
 
         SubagentTool tool = new SubagentTool(
                 registry, "spawn", "subagent",
-                () -> null, () -> "session-1", () -> "/tmp/proj", 0);
+                () -> null, () -> "session-1", () -> "/tmp/proj", 0, CODEC);
         tool.execute(Map.of("prompt", "task", "cwd", "src/main"), runContext()).join();
 
         assertEquals("/tmp/proj/src/main", provider.specs.get(0).resolvedCwd());
@@ -164,7 +194,7 @@ class SubagentToolDeliveryTest {
         registry.register(new RecordingProvider("spawn",
                 new SubagentProvider.SubagentCapabilities(false, false, true)));
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute(Map.of(), runContext()).join();
 
         assertTrue(result.isError());
@@ -178,12 +208,12 @@ class SubagentToolDeliveryTest {
         registry.register(new RecordingProvider("spawn",
                 new SubagentProvider.SubagentCapabilities(false, false, true)));
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute("not-a-map", runContext()).join();
 
         assertTrue(result.isError());
         ToolExecutionResult.Failure failure = assertInstanceOf(ToolExecutionResult.Failure.class, result);
-        assertEquals("BAD_ARGS", failure.error().info().code());
+        assertEquals("INVALID_ARGS", failure.error().info().code());
     }
 
     @Test
@@ -194,7 +224,7 @@ class SubagentToolDeliveryTest {
         provider.nextResult = new SubagentProvider.SubagentResult("error", List.of(), "run-9");
         registry.register(provider);
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute(Map.of("prompt", "t"), runContext()).join();
 
         assertTrue(result.isError());
@@ -210,7 +240,7 @@ class SubagentToolDeliveryTest {
         provider.nextResult = new SubagentProvider.SubagentResult("aborted", List.of(), "run-9");
         registry.register(provider);
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute(Map.of("prompt", "t"), runContext()).join();
 
         assertTrue(result.isError());
@@ -226,7 +256,7 @@ class SubagentToolDeliveryTest {
         provider.nextResult = new SubagentProvider.SubagentResult("max-tokens", List.of(), "run-2");
         registry.register(provider);
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute(Map.of("prompt", "t"), runContext()).join();
 
         // max-tokens 不属于 error/aborted，走成功路径但内容为提示文本。
@@ -244,7 +274,7 @@ class SubagentToolDeliveryTest {
         provider.nextFailure = new IllegalStateException("backend unavailable");
         registry.register(provider);
 
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
         ToolExecutionResult result = tool.execute(Map.of("prompt", "t"), runContext()).join();
 
         assertTrue(result.isError());
@@ -256,7 +286,7 @@ class SubagentToolDeliveryTest {
     @Test
     void unknownProviderActivationFailsGracefully() {
         SubagentRegistry registry = new SubagentRegistry();
-        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent");
+        SubagentTool tool = new SubagentTool(registry, "spawn", "subagent", CODEC);
 
         ToolExecutionResult result = tool.execute(Map.of("prompt", "t"), runContext()).join();
 

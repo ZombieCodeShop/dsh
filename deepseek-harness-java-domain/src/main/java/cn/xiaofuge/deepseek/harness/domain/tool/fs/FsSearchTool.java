@@ -1,28 +1,22 @@
 package cn.xiaofuge.deepseek.harness.domain.tool.fs;
 
-import cn.xiaofuge.deepseek.harness.domain.model.valobj.TextBlock;
-import cn.xiaofuge.deepseek.harness.domain.tool.fs.adapter.port.IFsPort;
-import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolDefinition;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolExecutionResult;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolRunContext;
+import cn.xiaofuge.deepseek.harness.domain.tool.adapter.JsonSchemaTool;
+import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolJsonCodec;
+import cn.xiaofuge.deepseek.harness.domain.tool.fs.adapter.port.IFsPort;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
  * 文件搜索工具。
- * <p>
- * 执行流程：
- * 1. 接收 glob 搜索模式；
- * 2. 在文件系统中查找匹配文件；
- * 3. 返回搜索结果。
  *
  * <p>调用流程：Agent 发起 tool call → ToolRegistry 查找工具 → Guard 校验 → ToolExecutor 执行 → 结果回填。</p>
- * <p>示例：工具名 fs_read 与 JSON 参数先经过校验，再生成 ToolExecutionResult。</p>
  * @author 小傅哥
  * @website bugstack.cn
  */
-public class FsSearchTool implements ToolDefinition {
+public class FsSearchTool extends JsonSchemaTool<FsSearchTool.Input> {
 
     private static final String NAME = "fs_search";
     private static final String DESCRIPTION =
@@ -32,43 +26,37 @@ public class FsSearchTool implements ToolDefinition {
 
     private static final int DEFAULT_MAX = 100;
 
+    private static final String PARAMETERS_JSON = """
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["directory", "pattern"],
+              "properties": {
+                "directory": {
+                  "type": "string",
+                  "description": "Root directory to search in. Defaults to the agent's working directory."
+                },
+                "pattern": {
+                  "type": "string",
+                  "description": "Glob pattern to match files. Examples: *.java, **/*.json, *.ts"
+                },
+                "max_results": {
+                  "type": "integer",
+                  "description": "Maximum number of results. Default 100."
+                }
+              }
+            }
+            """;
+
     private final IFsPort fsService;
 
-    /**
-     * 处理Fs 搜索 工具。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param fsService fs Service参数。
-     * @return 方法执行结果。
-     */
-    public FsSearchTool(IFsPort fsService) {
+    public FsSearchTool(IFsPort fsService, ToolJsonCodec codec) {
+        super(Input.class, codec, PARAMETERS_JSON);
         this.fsService = fsService;
     }
 
     @Override public String name() { return NAME; }
     @Override public String description() { return DESCRIPTION; }
-
-    @Override
-    public Map<String, Object> parameters() {
-        return Map.of(
-                "type", "object",
-                "additionalProperties", false,
-                "properties", Map.of(
-                        "directory", Map.of(
-                                "type", "string",
-                                "description", "Root directory to search in. Defaults to the agent's working directory."
-                        ),
-                        "pattern", Map.of(
-                                "type", "string",
-                                "description", "Glob pattern to match files. Examples: *.java, **/*.json, *.ts"
-                        ),
-                        "max_results", Map.of(
-                                "type", "integer",
-                                "description", "Maximum number of results. Default 100."
-                        )
-                ),
-                "required", List.of("directory", "pattern")
-        );
-    }
 
     @Override
     public Map<String, Object> outputSchema() {
@@ -86,58 +74,33 @@ public class FsSearchTool implements ToolDefinition {
     }
 
     @Override
-    /**
-     * 执行工具调用。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param args 启动参数。
-     * @param ctx ctx参数。
-     * @return 方法执行结果。
-     */
+    protected CompletableFuture<ToolExecutionResult> run(Input input, ToolRunContext ctx) {
+        List<String> matches = fsService.search(input.directory(), input.pattern(), input.max_results());
 
-    @SuppressWarnings("unchecked")
-    public CompletableFuture<ToolExecutionResult> execute(Object args, ToolRunContext ctx) {
-        try {
-            Map<String, Object> argMap = (Map<String, Object>) args;
-            String directory = String.valueOf(argMap.get("directory"));
-            String pattern = String.valueOf(argMap.get("pattern"));
-
-            if (directory == null || directory.isBlank()) {
-                return CompletableFuture.completedFuture(
-                        ToolExecutionResult.fail("directory parameter is required", "MISSING_PARAM"));
-            }
-            if (pattern == null || pattern.isBlank()) {
-                return CompletableFuture.completedFuture(
-                        ToolExecutionResult.fail("pattern parameter is required", "MISSING_PARAM"));
-            }
-
-            int maxResults = argMap.get("max_results") != null
-                    ? ((Number) argMap.get("max_results")).intValue()
-                    : DEFAULT_MAX;
-
-            List<String> matches = fsService.search(directory, pattern, maxResults);
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("Found ").append(matches.size()).append(" files matching '")
-              .append(pattern).append("' in ").append(directory).append(":\n");
-            for (String match : matches) {
-                sb.append("  ").append(match).append("\n");
-            }
-
-            return CompletableFuture.completedFuture(
-                    ToolExecutionResult.ok(List.of(new TextBlock(sb.toString()))));
-        } catch (Exception e) {
-            return CompletableFuture.completedFuture(
-                    ToolExecutionResult.fail("fs_search failed: " + e.getMessage(), "EXECUTION_ERROR"));
+        StringBuilder sb = new StringBuilder();
+        sb.append("Found ").append(matches.size()).append(" files matching '")
+          .append(input.pattern()).append("' in ").append(input.directory()).append(":\n");
+        for (String match : matches) {
+            sb.append("  ").append(match).append("\n");
         }
+        return ok(sb.toString());
     }
-    /**
-     * 判断当前状态是否满足条件。
-     * 流程：应用领域规则 → 更新领域对象 → 返回结果。
-     * @param args 启动参数。
-     * @return 布尔结果：满足条件为 true，否则 false。
-     */
-
 
     @Override
     public boolean isConcurrencySafe(Object args) { return true; }
+
+    /** 入参模型：directory/pattern 必填；max_results 缺省 100。 */
+    record Input(String directory, String pattern, Integer max_results) {
+        Input {
+            directory = directory == null ? null : directory.trim();
+            pattern = pattern == null ? null : pattern.trim();
+            if (directory == null || directory.isEmpty()) {
+                throw new IllegalArgumentException("directory is required");
+            }
+            if (pattern == null || pattern.isEmpty()) {
+                throw new IllegalArgumentException("pattern is required");
+            }
+            max_results = max_results == null || max_results < 1 ? DEFAULT_MAX : max_results;
+        }
+    }
 }

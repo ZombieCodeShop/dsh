@@ -5,7 +5,7 @@ import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolDefinition;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolExecutionResult;
 import cn.xiaofuge.deepseek.harness.domain.model.entity.ToolRunContext;
 import cn.xiaofuge.deepseek.harness.domain.model.valobj.ContentBlock;
-
+import cn.xiaofuge.deepseek.harness.domain.tool.adapter.ToolJsonCodec;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +29,28 @@ public class SubagentTool implements ToolDefinition {
     private static final String DEFAULT_TOOL_NAME = "subagent";
     private static final String DEFAULT_PROVIDER = "spawn-in-process";
 
+    private static final String PARAMETERS_JSON = """
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["prompt"],
+              "properties": {
+                "prompt": {
+                  "type": "string",
+                  "description": "The task description / prompt for the subagent."
+                },
+                "cwd": {
+                  "type": "string",
+                  "description": "Optional initial working directory for the subagent. Relative paths resolve against the current directory. Omitted to inherit the current directory."
+                },
+                "run_in_background": {
+                  "type": "boolean",
+                  "description": "If true, run the subagent in the background (default: false)."
+                }
+              }
+            }
+            """;
+
     private final String toolName;
     private final SubagentRegistry registry;
     private final String providerName;
@@ -36,19 +58,21 @@ public class SubagentTool implements ToolDefinition {
     private final Supplier<String> parentSessionIdSupplier;
     private final Supplier<String> parentCwdSupplier;
     private final int delegationDepth;
+    private final ToolJsonCodec codec;
+    private final Map<String, Object> parameters;
 
     /**
      * 初始化子智能体工具（默认 provider，无父级上下文）。
      */
-    public SubagentTool(SubagentRegistry registry, String providerName) {
-        this(registry, providerName, DEFAULT_TOOL_NAME);
+    public SubagentTool(SubagentRegistry registry, String providerName, ToolJsonCodec codec) {
+        this(registry, providerName, DEFAULT_TOOL_NAME, null, null, null, 0, codec);
     }
 
     /**
      * 初始化指定提供者名称的子智能体工具。
      */
-    public SubagentTool(SubagentRegistry registry, String providerName, String toolName) {
-        this(registry, providerName, toolName, (Supplier<AgentOptions>) null);
+    public SubagentTool(SubagentRegistry registry, String providerName, String toolName, ToolJsonCodec codec) {
+        this(registry, providerName, toolName, null, null, null, 0, codec);
     }
 
     /**
@@ -58,9 +82,10 @@ public class SubagentTool implements ToolDefinition {
             SubagentRegistry registry,
             String providerName,
             String toolName,
-            Supplier<AgentOptions> parentOptionsSupplier
+            Supplier<AgentOptions> parentOptionsSupplier,
+            ToolJsonCodec codec
     ) {
-        this(registry, providerName, toolName, parentOptionsSupplier, null, null, 0);
+        this(registry, providerName, toolName, parentOptionsSupplier, null, null, 0, codec);
     }
 
     /**
@@ -73,6 +98,7 @@ public class SubagentTool implements ToolDefinition {
      * @param parentSessionIdSupplier 父级会话标识（谱系事实）。
      * @param parentCwdSupplier 父级当前有效目录（子级目录继承基线）。
      * @param delegationDepth 当前父级委派深度。
+     * @param codec 工具侧 JSON 能力端口。
      */
     public SubagentTool(
             SubagentRegistry registry,
@@ -81,7 +107,8 @@ public class SubagentTool implements ToolDefinition {
             Supplier<AgentOptions> parentOptionsSupplier,
             Supplier<String> parentSessionIdSupplier,
             Supplier<String> parentCwdSupplier,
-            int delegationDepth
+            int delegationDepth,
+            ToolJsonCodec codec
     ) {
         this.registry = registry;
         this.providerName = providerName == null || providerName.isBlank() ? DEFAULT_PROVIDER : providerName;
@@ -90,6 +117,14 @@ public class SubagentTool implements ToolDefinition {
         this.parentSessionIdSupplier = parentSessionIdSupplier;
         this.parentCwdSupplier = parentCwdSupplier;
         this.delegationDepth = delegationDepth;
+        this.codec = codec;
+        Object parsed = codec == null ? null : codec.parse(PARAMETERS_JSON);
+        if (!(parsed instanceof Map<?, ?> map)) {
+            throw new IllegalStateException("no tool-json codec configured for tool " + toolName);
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> typed = (Map<String, Object>) map;
+        this.parameters = java.util.Collections.unmodifiableMap(typed);
     }
 
     @Override
@@ -109,59 +144,35 @@ public class SubagentTool implements ToolDefinition {
 
     @Override
     public Map<String, Object> parameters() {
-        Map<String, Object> props = new LinkedHashMap<>();
-        props.put("type", "object");
-
-        Map<String, Object> properties = new LinkedHashMap<>();
-
-        Map<String, Object> promptProp = new LinkedHashMap<>();
-        promptProp.put("type", "string");
-        promptProp.put("description", "The task description / prompt for the subagent.");
-        properties.put("prompt", promptProp);
-
-        Map<String, Object> cwdProp = new LinkedHashMap<>();
-        cwdProp.put("type", "string");
-        cwdProp.put("description",
-                "Optional initial working directory for the subagent. Relative paths resolve "
-                        + "against the current directory. Omitted to inherit the current directory.");
-        properties.put("cwd", cwdProp);
-
-        Map<String, Object> bgProp = new LinkedHashMap<>();
-        bgProp.put("type", "boolean");
-        bgProp.put("description", "If true, run the subagent in the background (default: false).");
-        properties.put("run_in_background", bgProp);
-
-        props.put("properties", properties);
-        props.put("required", List.of("prompt"));
-
-        return props;
+        return parameters;
     }
 
     /**
      * 执行工具调用：以 delivery=parent 发起统一激活并等待结果。
      */
     @Override
-    @SuppressWarnings("unchecked")
     public CompletableFuture<ToolExecutionResult> execute(Object args, ToolRunContext exec) {
-        Map<String, Object> argMap;
-        if (args instanceof Map) {
-            argMap = (Map<String, Object>) args;
-        } else {
-            return CompletableFuture.completedFuture(
-                    ToolExecutionResult.fail("Invalid args type", "BAD_ARGS")
-            );
+        if (!(args instanceof Map<?, ?>)) {
+            return done(ToolExecutionResult.fail(
+                    "expected object arguments but got "
+                            + (args == null ? "null" : args.getClass().getSimpleName()),
+                    "INVALID_ARGS"));
+        }
+        StartInput input;
+        try {
+            input = codec.convert(args, StartInput.class);
+        } catch (IllegalArgumentException e) {
+            return done(ToolExecutionResult.fail(
+                    "invalid tool arguments: " + e.getMessage(), "INVALID_ARGS"));
+        }
+        if (input.prompt() == null || input.prompt().isBlank()) {
+            return done(ToolExecutionResult.fail("prompt is required", "MISSING_PROMPT"));
         }
 
-        String prompt = argMap.get("prompt") instanceof String s ? s : "";
-        if (prompt.isEmpty()) {
-            return CompletableFuture.completedFuture(
-                    ToolExecutionResult.fail("prompt is required", "MISSING_PROMPT")
-            );
-        }
-        String requestCwd = argMap.get("cwd") instanceof String cwd && !cwd.isBlank() ? cwd.trim() : null;
+        String requestCwd = input.cwd();
 
         SubagentProvider.SubagentStartRequest request = new SubagentProvider.SubagentStartRequest(
-                prompt,
+                input.prompt(),
                 parentOptionsSupplier == null ? null : parentOptionsSupplier.get(),
                 parentSessionIdSupplier == null ? null : parentSessionIdSupplier.get(),
                 parentCwdSupplier == null ? null : parentCwdSupplier.get(),
@@ -206,6 +217,10 @@ public class SubagentTool implements ToolDefinition {
                 ));
     }
 
+    private static CompletableFuture<ToolExecutionResult> done(ToolExecutionResult result) {
+        return CompletableFuture.completedFuture(result);
+    }
+
     private static String extractMessage(Throwable e) {
         Throwable cause = e;
         while (cause.getCause() != null && cause.getCause() != cause) {
@@ -223,5 +238,15 @@ public class SubagentTool implements ToolDefinition {
     @Override
     public long timeoutMs() {
         return 300_000; // 5 minutes default
+    }
+
+    /**
+     * 入参模型：JSON 字段名即组件名。run_in_background 暂未实现，保留以兼容既有 schema。
+     */
+    private record StartInput(String prompt, String cwd, boolean run_in_background) {
+        StartInput {
+            prompt = prompt == null ? null : prompt.trim();
+            cwd = cwd == null || cwd.isBlank() ? null : cwd.trim();
+        }
     }
 }
